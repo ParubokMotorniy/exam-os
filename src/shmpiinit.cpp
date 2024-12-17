@@ -45,7 +45,7 @@ void SHMPI::ProcessProgramArgs(int argc, char *argv[], std::unique_ptr<SHMPI::Sh
         if (interfaceType < 0 || interfaceType > 1 || nProcessesInvolved < 0)
             throw;
 
-        SHMPI::OtherProcesses processesDescription{};
+        SHMPI::GlobalExecutionData processesDescription{};
         processesDescription.nProcesses = static_cast<size_t>(nProcessesInvolved);
 
         if (interfaceType == 0)

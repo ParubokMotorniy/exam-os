@@ -11,6 +11,8 @@
 #include <unistd.h>
 #include <cstring>
 #include <iostream>
+#include <thread>
+#include <future>
 
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -35,17 +37,17 @@ namespace SHMPI
         std::string processAddressV4;
     };
 
-    struct OtherProcesses
-    {
-        size_t nProcesses;
-        std::optional<std::vector<RemoteHost>> hosts;
-        std::optional<std::string> sharedMemoryName;
-    };
-
     enum class CommunicationType
     {
         SHMPI_LOCAL,
         SHMPI_NETWORK,
+    };
+
+    struct GlobalExecutionData
+    {
+        size_t nProcesses;
+        std::optional<std::vector<RemoteHost>> hosts;
+        std::optional<std::string> sharedMemoryName;
     };
 
     constexpr size_t SHARED_MEMORY_BUFFER_SIZE = 4096; // in bytes
@@ -79,12 +81,12 @@ namespace SHMPI
 
             if (comType == CommunicationType::SHMPI_LOCAL)
             {
-                munmap(mappedSegments, sizeof(SharedMemoryProcessSegment) * otherProcesses.nProcesses);
+                munmap(mappedSegments, sizeof(SharedMemoryProcessSegment) * executionData.nProcesses);
                 sem_close(shmpiBarrierSemaphore);
 
                 if (myRank == 0)
                 {
-                    shm_unlink(otherProcesses.sharedMemoryName.value().c_str());
+                    shm_unlink(executionData.sharedMemoryName.value().c_str());
 
                     sem_destroy(shmpiBarrierSemaphore);
                     sem_destroy(shmpiTerminationSemaphore);
@@ -92,16 +94,18 @@ namespace SHMPI
 
                 close(sharedFd);
             }
+
+            delete[] sendingFlags;
         }
 
         [[nodiscard]] size_t getRank() const { return myRank; }
-        [[nodiscard]] size_t getGlobalNumberOfOutputs() const { return otherProcesses.nProcesses; }
+        [[nodiscard]] size_t getGlobalNumberOfOutputs() const { return executionData.nProcesses; }
 
         template <typename T>
             requires IsShmpiTransmittable<T> // returns 0 on success
         int SHMPI_Send(const T *buf, int count, size_t dest)
         {
-            if (dest >= otherProcesses.nProcesses)
+            if (dest >= executionData.nProcesses)
             {
                 return -1;
             }
@@ -121,10 +125,10 @@ namespace SHMPI
         }
 
         template <typename T>
-            requires IsShmpiTransmittable<T> //returns the number of bytes read
-        int SHMPI_Recv(T *buf, int count, size_t source, int readTimeOut = -1)
+            requires IsShmpiTransmittable<T> // returns the number of bytes read
+        int SHMPI_Read(T *buf, int count, size_t source, int readTimeOut = -1)
         {
-            if (source >= otherProcesses.nProcesses)
+            if (source >= executionData.nProcesses)
             {
                 return 0;
             }
@@ -144,16 +148,19 @@ namespace SHMPI
 
         template <typename T>
             requires IsShmpiTransmittable<T>
-        int SHMPI_Isend(const T *buf, int count, int dest);
+        void SHMPI_ISend(const T *buf, int count, int dest, std::future<int> &result);
 
         template <typename T>
             requires IsShmpiTransmittable<T>
-        int SHMPI_Irecv(T *buf, int count, int source);
+        void SHMPI_IRead(const T *buf, int count, int dest, std::future<size_t> &result);
 
     private:
-        ShmpiInstance(size_t processRank, OtherProcesses &&hosts) : myRank(processRank), otherProcesses(std::move(hosts))
+        ShmpiInstance(size_t processRank, GlobalExecutionData &&hosts) : myRank(processRank), executionData(std::move(hosts))
         {
-            if (otherProcesses.sharedMemoryName.has_value())
+            iAmWaitingForDataAsync.clear();
+            sendingFlags = new std::atomic_flag[executionData.nProcesses];
+
+            if (executionData.sharedMemoryName.has_value())
                 comType = CommunicationType::SHMPI_LOCAL;
             else
                 comType = CommunicationType::SHMPI_NETWORK;
@@ -163,24 +170,24 @@ namespace SHMPI
             {
                 if (myRank == 0)
                 {
-                    shm_unlink(otherProcesses.sharedMemoryName.value().c_str());
-                    unlink(otherProcesses.sharedMemoryName.value().c_str());
+                    shm_unlink(executionData.sharedMemoryName.value().c_str());
+                    unlink(executionData.sharedMemoryName.value().c_str());
 
                     // initialize shared memory and mutexes for other procs to use
-                    sharedFd = shm_open(otherProcesses.sharedMemoryName.value().c_str(), O_RDWR | O_CREAT | O_TRUNC, S_IRWXG | S_IRWXU);
+                    sharedFd = shm_open(executionData.sharedMemoryName.value().c_str(), O_RDWR | O_CREAT | O_TRUNC, S_IRWXG | S_IRWXU);
                     if (sharedFd < 0)
                         throw std::runtime_error{"Failed to create the shared memory file!"};
 
-                    if (ftruncate(sharedFd, sizeof(SharedMemoryProcessSegment) * otherProcesses.nProcesses))
+                    if (ftruncate(sharedFd, sizeof(SharedMemoryProcessSegment) * executionData.nProcesses))
                         throw std::runtime_error{"Failed to truncate the shared memory file to the required length!"};
 
                     void *sharedMemoryPtr;
-                    if ((sharedMemoryPtr = mmap(nullptr, sizeof(SharedMemoryProcessSegment) * otherProcesses.nProcesses, PROT_READ | PROT_WRITE, MAP_SHARED, sharedFd, 0)) == MAP_FAILED)
+                    if ((sharedMemoryPtr = mmap(nullptr, sizeof(SharedMemoryProcessSegment) * executionData.nProcesses, PROT_READ | PROT_WRITE, MAP_SHARED, sharedFd, 0)) == MAP_FAILED)
                         throw std::runtime_error{"Failed to map the shared memory file for the main process!"};
 
                     mappedSegments = static_cast<SharedMemoryProcessSegment *>(sharedMemoryPtr);
 
-                    for (size_t i = 0; i < otherProcesses.nProcesses; ++i)
+                    for (size_t i = 0; i < executionData.nProcesses; ++i)
                     {
                         (mappedSegments + i)->ownerProcessRank = i;
                         (mappedSegments + i)->lastAccessorRank = -1;
@@ -192,21 +199,21 @@ namespace SHMPI
                 }
                 else
                 {
-                    while ((sharedFd = shm_open(otherProcesses.sharedMemoryName.value().c_str(), O_RDWR, 660)) < 0)
+                    while ((sharedFd = shm_open(executionData.sharedMemoryName.value().c_str(), O_RDWR, 660)) < 0)
                     {
                     } // TODO: add some better termination criteria
 
                     void *sharedMemoryPtr;
-                    if ((sharedMemoryPtr = mmap(nullptr, sizeof(SharedMemoryProcessSegment) * otherProcesses.nProcesses, PROT_READ | PROT_WRITE, MAP_SHARED, sharedFd, 0)) == MAP_FAILED)
+                    if ((sharedMemoryPtr = mmap(nullptr, sizeof(SharedMemoryProcessSegment) * executionData.nProcesses, PROT_READ | PROT_WRITE, MAP_SHARED, sharedFd, 0)) == MAP_FAILED)
                         throw std::runtime_error{"Failed to map the shared memory file for a slave process!"};
 
                     mappedSegments = static_cast<SharedMemoryProcessSegment *>(sharedMemoryPtr);
                 }
 
-                if ((shmpiBarrierSemaphore = sem_open(shmpiBarrierName.c_str(), O_CREAT | O_RDWR, S_IRWXG | S_IRWXU, otherProcesses.nProcesses)) == SEM_FAILED)
+                if ((shmpiBarrierSemaphore = sem_open(shmpiBarrierName.c_str(), O_CREAT | O_RDWR, S_IRWXG | S_IRWXU, executionData.nProcesses)) == SEM_FAILED)
                     throw std::runtime_error{"Failed to open a synchronization semaphore!"};
 
-                if ((shmpiTerminationSemaphore = sem_open(shmpiTerminationBarrierName.c_str(), O_CREAT | O_RDWR, S_IRWXG | S_IRWXU, otherProcesses.nProcesses)) == SEM_FAILED)
+                if ((shmpiTerminationSemaphore = sem_open(shmpiTerminationBarrierName.c_str(), O_CREAT | O_RDWR, S_IRWXG | S_IRWXU, executionData.nProcesses)) == SEM_FAILED)
                     throw std::runtime_error{"Failed to open a termination semaphore!"};
             }
         }
@@ -231,13 +238,10 @@ namespace SHMPI
             requires IsShmpiTransmittable<T>
         size_t ReadFromLocal(T *buf, size_t count, size_t source, int readTimeOut = -1)
         {
-            if (count == 0)
-                return 0;
-
             SharedMemoryProcessSegment *mySegment = mappedSegments + myRank;
 
             auto readProcedure = [=]() -> size_t
-            {      
+            {
                 sem_wait(&(mySegment->bufferAccessMutex));
 
                 if (mySegment->lastAccessorRank == source) // TODO: probably think of something more efficient
@@ -255,32 +259,49 @@ namespace SHMPI
             };
 
             size_t nRead{0};
-            if(readTimeOut == -1)
+            if (readTimeOut == -1)
             {
-                while(nRead == 0)
+                while (nRead == 0)
                 {
                     nRead = readProcedure();
                 }
-            }else
-            {   
-                while(readTimeOut > 0)
+            }
+            else
+            {
+                while (readTimeOut > 0)
                 {
                     nRead = readProcedure();
                     --readTimeOut;
                 }
-
             }
 
             std::cout << "Received data from " << source << " . Me " << myRank << std::endl;
-
             return nRead;
+        }
+
+        template <typename T>
+            requires IsShmpiTransmittable<T>
+        void IReadFromLocal(T *buf, size_t count, size_t source, std::atomic_flag &flagToClear, std::promise<size_t> promise, int readTimeOut = -1)
+        {
+            size_t result = ReadFromLocal(buf, count, source, readTimeOut);
+            promise.set_value(result);
+            flagToClear.clear();
+        }
+
+        template <typename T>
+            requires IsShmpiTransmittable<T>
+        void ISendToLocal(const T *buf, int count, size_t dest, std::atomic_flag &flagToClear, std::promise<int> promise)
+        {
+            int result = SendToLocal(buf, count, dest);
+            promise.set_value(result);
+            flagToClear.clear();
         }
 
         void SynchronizeOnBarrier(sem_t *semPtr)
         {
             sem_wait(semPtr);
 
-            int semValue{otherProcesses.nProcesses};
+            int semValue{executionData.nProcesses};
             while (semValue != 0)
             {
                 sem_getvalue(semPtr, &semValue);
@@ -290,7 +311,7 @@ namespace SHMPI
         }
 
     private:
-        OtherProcesses otherProcesses;
+        GlobalExecutionData executionData;
         size_t myRank{0};
         CommunicationType comType;
 
@@ -299,11 +320,69 @@ namespace SHMPI
 
         const std::string shmpiBarrierName{"_shmpi_barrier_"};
         const std::string shmpiTerminationBarrierName{"_shmpi_termination_"};
-        
+
         sem_t *shmpiBarrierSemaphore{};
         sem_t *shmpiTerminationSemaphore{};
+
+        std::atomic_flag iAmWaitingForDataAsync;
+        std::atomic_flag *sendingFlags; // we can not be sending to the same process at the same time
     };
 
+    template <typename T>
+        requires IsShmpiTransmittable<T>
+    void ShmpiInstance::SHMPI_ISend(const T *buf, int count, int dest, std::future<int> &result)
+    {
+        if (dest >= executionData.nProcesses || (sendingFlags + dest)->test())
+        {
+            return;
+        }
+
+        if (comType == CommunicationType::SHMPI_LOCAL)
+        {
+            if (sizeof(T) * count > SHARED_MEMORY_BUFFER_SIZE || count == 0)
+            {
+                return;
+            }
+
+            std::promise<int> sendResultPromise{};
+            result = sendResultPromise.get_future();
+            (sendingFlags + dest)->test_and_set();
+            
+            std::thread sender{ShmpiInstance::ISendToLocal, this, buf, count, dest, std::ref(*(sendingFlags + dest)), std::move(sendResultPromise)};
+
+            return;
+        }
+
+        return;
+    }
+
+    template <typename T>
+        requires IsShmpiTransmittable<T>
+    void ShmpiInstance::SHMPI_IRead(const T *buf, int count, int dest, std::future<size_t> &result)
+    {
+        if (dest >= executionData.nProcesses || iAmWaitingForDataAsync.test()) // performing two asynchronous reads currently is not possible
+        {
+            return;
+        }
+
+        if (comType == CommunicationType::SHMPI_LOCAL)
+        {
+            if (sizeof(T) * count > SHARED_MEMORY_BUFFER_SIZE || count = 0)
+            {
+                return;
+            }
+
+            std::promise<size_t> readResultPromise{};
+            result = readResultPromise.get_future();
+            iAmWaitingForDataAsync.test_and_set();
+
+            std::thread sender{ShmpiInstance::IReadFromLocal, this, buf, count, std::ref(iAmWaitingForDataAsync), std::move(readResultPromise), dest};
+
+            return;
+        }
+
+        return;
+    }
 }
 
 #endif
