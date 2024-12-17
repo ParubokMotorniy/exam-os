@@ -10,6 +10,7 @@
 #include <concepts>
 #include <unistd.h>
 #include <cstring>
+#include <iostream>
 
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -55,7 +56,7 @@ namespace SHMPI
         sem_t bufferAccessMutex;                              // controls the writes to the buffer
         unsigned char writeBuffer[SHARED_MEMORY_BUFFER_SIZE]; // where other processes will write their stuff
 
-        int lastAccessorRank{-1};                             // the rank of process who accessed the segment most recently top write some data
+        size_t lastAccessorRank{0}; // the rank of process who accessed the segment most recently top write some data
         size_t bytesWritten{0};
     };
 
@@ -72,27 +73,74 @@ namespace SHMPI
 
         ~ShmpiInstance()
         {
+            std::cout << "Terminating " << myRank << std::endl;
+
+            SynchronizeOnBarrier(shmpiTerminationSemaphore);
+
             if (comType == CommunicationType::SHMPI_LOCAL)
             {
                 munmap(mappedSegments, sizeof(SharedMemoryProcessSegment) * otherProcesses.nProcesses);
+                sem_close(shmpiBarrierSemaphore);
 
                 if (myRank == 0)
                 {
-
                     shm_unlink(otherProcesses.sharedMemoryName.value().c_str());
+
+                    sem_destroy(shmpiBarrierSemaphore);
+                    sem_destroy(shmpiTerminationSemaphore);
                 }
+
+                close(sharedFd);
             }
         }
 
         [[nodiscard]] size_t getRank() const { return myRank; }
+        [[nodiscard]] size_t getGlobalNumberOfOutputs() const { return otherProcesses.nProcesses; }
 
         template <typename T>
-            requires IsShmpiTransmittable<T>
-        int SHMPI_Send(const T *buf, int count, int dest);
+            requires IsShmpiTransmittable<T> // returns 0 on success
+        int SHMPI_Send(const T *buf, int count, size_t dest)
+        {
+            if (dest >= otherProcesses.nProcesses)
+            {
+                return -1;
+            }
+
+            if (comType == CommunicationType::SHMPI_LOCAL)
+            {
+                if (sizeof(T) * count > SHARED_MEMORY_BUFFER_SIZE)
+                {
+                    return -1;
+                }
+
+                SendToLocal(buf, count, dest);
+                return 0;
+            }
+
+            return -1;
+        }
 
         template <typename T>
-            requires IsShmpiTransmittable<T>
-        int SHMPI_Recv(T *buf, int count, int source);
+            requires IsShmpiTransmittable<T> //returns the number of bytes read
+        int SHMPI_Recv(T *buf, int count, size_t source, int readTimeOut = -1)
+        {
+            if (source >= otherProcesses.nProcesses)
+            {
+                return 0;
+            }
+
+            if (comType == CommunicationType::SHMPI_LOCAL)
+            {
+                if (sizeof(T) * count > SHARED_MEMORY_BUFFER_SIZE)
+                {
+                    return 0;
+                }
+
+                return ReadFromLocal(buf, count, source, readTimeOut);
+            }
+
+            return 0;
+        }
 
         template <typename T>
             requires IsShmpiTransmittable<T>
@@ -115,10 +163,11 @@ namespace SHMPI
             {
                 if (myRank == 0)
                 {
+                    shm_unlink(otherProcesses.sharedMemoryName.value().c_str());
                     unlink(otherProcesses.sharedMemoryName.value().c_str());
 
                     // initialize shared memory and mutexes for other procs to use
-                    sharedFd = shm_open(otherProcesses.sharedMemoryName.value().c_str(), O_RDWR | O_CREAT | O_TRUNC, 660);
+                    sharedFd = shm_open(otherProcesses.sharedMemoryName.value().c_str(), O_RDWR | O_CREAT | O_TRUNC, S_IRWXG | S_IRWXU);
                     if (sharedFd < 0)
                         throw std::runtime_error{"Failed to create the shared memory file!"};
 
@@ -154,10 +203,11 @@ namespace SHMPI
                     mappedSegments = static_cast<SharedMemoryProcessSegment *>(sharedMemoryPtr);
                 }
 
-                if((shmpiBarrierSemaphore = sem_open(shmpiBarrierName.c_str(), O_CREAT, 660, otherProcesses.nProcesses)) == SEM_FAILED)
-                    throw std::runtime_error{"Failed to open a semaphore!"};
+                if ((shmpiBarrierSemaphore = sem_open(shmpiBarrierName.c_str(), O_CREAT | O_RDWR, S_IRWXG | S_IRWXU, otherProcesses.nProcesses)) == SEM_FAILED)
+                    throw std::runtime_error{"Failed to open a synchronization semaphore!"};
 
-                
+                if ((shmpiTerminationSemaphore = sem_open(shmpiTerminationBarrierName.c_str(), O_CREAT | O_RDWR, S_IRWXG | S_IRWXU, otherProcesses.nProcesses)) == SEM_FAILED)
+                    throw std::runtime_error{"Failed to open a termination semaphore!"};
             }
         }
 
@@ -166,67 +216,92 @@ namespace SHMPI
         void SendToLocal(const T *buf, int count, size_t dest)
         {
             SharedMemoryProcessSegment *targetSegment = mappedSegments + dest;
-            sem_wait(&targetSegment->bufferAccessMutex);
+            sem_wait(&(targetSegment->bufferAccessMutex));
 
             memcpy(targetSegment->writeBuffer, buf, sizeof(T) * count);
             targetSegment->lastAccessorRank = myRank;
             targetSegment->bytesWritten = sizeof(T) * count;
 
-            sem_post(&targetSegment->bufferAccessMutex);
+            sem_post(&(targetSegment->bufferAccessMutex));
+
+            std::cout << "Sent data from " << myRank << " to " << dest << std::endl;
         }
 
         template <typename T>
             requires IsShmpiTransmittable<T>
-        size_t ReadFromLocal(T *buf, int count, size_t source)
+        size_t ReadFromLocal(T *buf, size_t count, size_t source, int readTimeOut = -1)
         {
-            SharedMemoryProcessSegment *sourceSegment = mappedSegments + source;
+            if (count == 0)
+                return 0;
 
-            size_t maxLockAttempts{10};
-            int mostRecentWriter = -1;
-            while(maxLockAttempts > 0)
-            {
-                sem_wait(&sourceSegment->bufferAccessMutex);   
+            SharedMemoryProcessSegment *mySegment = mappedSegments + myRank;
 
-                if(sourceSegment->lastAccessorRank == source) //TODO: probably think of something more efficient
+            auto readProcedure = [=]() -> size_t
+            {      
+                sem_wait(&(mySegment->bufferAccessMutex));
+
+                if (mySegment->lastAccessorRank == source) // TODO: probably think of something more efficient
                 {
                     size_t numBytesToRead = std::min(SHARED_MEMORY_BUFFER_SIZE, sizeof(T) * count);
 
-                    memcpy(buf, sourceSegment->writeBuffer, numBytesToRead);
+                    memcpy(buf, mySegment->writeBuffer, numBytesToRead);
 
                     return numBytesToRead;
                 }
 
-                sem_post(&sourceSegment->bufferAccessMutex);
+                sem_post(&(mySegment->bufferAccessMutex));
 
-                --maxLockAttempts;
+                return 0;
+            };
+
+            size_t nRead{0};
+            if(readTimeOut == -1)
+            {
+                while(nRead == 0)
+                {
+                    nRead = readProcedure();
+                }
+            }else
+            {   
+                while(readTimeOut > 0)
+                {
+                    nRead = readProcedure();
+                    --readTimeOut;
+                }
+
             }
 
-            return 0;
+            std::cout << "Received data from " << source << " . Me " << myRank << std::endl;
+
+            return nRead;
         }
 
-        void BlockOnBarrier()
+        void SynchronizeOnBarrier(sem_t *semPtr)
         {
-            sem_wait(shmpiBarrierSemaphore);
+            sem_wait(semPtr);
 
             int semValue{otherProcesses.nProcesses};
-            while(semValue != 0)
+            while (semValue != 0)
             {
-                sem_getvalue(shmpiBarrierSemaphore, &semValue);
+                sem_getvalue(semPtr, &semValue);
             }
 
-            sem_post(shmpiBarrierSemaphore);
+            sem_post(semPtr);
         }
 
     private:
         OtherProcesses otherProcesses;
         size_t myRank{0};
         CommunicationType comType;
- 
+
         int sharedFd{-1};
         SharedMemoryProcessSegment *mappedSegments{};
 
-        const std::string shmpiBarrierName{"shmpi_barrier"};
-        sem_t *shmpiBarrierSemaphore;
+        const std::string shmpiBarrierName{"_shmpi_barrier_"};
+        const std::string shmpiTerminationBarrierName{"_shmpi_termination_"};
+        
+        sem_t *shmpiBarrierSemaphore{};
+        sem_t *shmpiTerminationSemaphore{};
     };
 
 }

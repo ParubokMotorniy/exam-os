@@ -12,7 +12,7 @@ void SHMPI::ProcessProgramArgs(int argc, char *argv[], std::unique_ptr<SHMPI::Sh
 
     try
     {
-        int processRank = std::stoll(argv[1]); // may throw as well
+        processRank = std::stoll(argv[1]); // may throw as well
 
         if (processRank < 0)
             throw;
@@ -48,7 +48,7 @@ void SHMPI::ProcessProgramArgs(int argc, char *argv[], std::unique_ptr<SHMPI::Sh
         SHMPI::OtherProcesses processesDescription{};
         processesDescription.nProcesses = static_cast<size_t>(nProcessesInvolved);
 
-        if (interfaceType = 0)
+        if (interfaceType == 0)
         {
             std::getline(configReader, configLine);
             processesDescription.sharedMemoryName.emplace(std::move(configLine));
