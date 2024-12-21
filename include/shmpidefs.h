@@ -99,7 +99,7 @@ namespace SHMPI
         }
 
         [[nodiscard]] size_t getRank() const { return myRank; }
-        [[nodiscard]] size_t getGlobalNumberOfOutputs() const { return executionData.nProcesses; }
+        [[nodiscard]] size_t getGlobalNumberOfProcesses() const { return executionData.nProcesses; }
 
         template <typename T>
             requires IsShmpiTransmittable<T> // returns 0 on success
@@ -112,13 +112,12 @@ namespace SHMPI
 
             if (comType == CommunicationType::SHMPI_LOCAL)
             {
-                if (sizeof(T) * count > SHARED_MEMORY_BUFFER_SIZE)
+                if (sizeof(T) * count > SHARED_MEMORY_BUFFER_SIZE || count == 0)
                 {
                     return -1;
                 }
 
-                SendToLocal(buf, count, dest);
-                return 0;
+                return SendToLocal(buf, count, dest);
             }
 
             return -1;
@@ -126,7 +125,7 @@ namespace SHMPI
 
         template <typename T>
             requires IsShmpiTransmittable<T> // returns the number of bytes read
-        int SHMPI_Read(T *buf, int count, size_t source, int readTimeOut = -1)
+        int SHMPI_ReadMyMessages(T *buf, int count, size_t source, int readTimeOut = -1)
         {
             if (source >= executionData.nProcesses)
             {
@@ -135,12 +134,12 @@ namespace SHMPI
 
             if (comType == CommunicationType::SHMPI_LOCAL)
             {
-                if (sizeof(T) * count > SHARED_MEMORY_BUFFER_SIZE)
+                if (sizeof(T) * count > SHARED_MEMORY_BUFFER_SIZE || count == 0)
                 {
                     return 0;
                 }
 
-                return ReadFromLocal(buf, count, source, readTimeOut);
+                return ReadMyMessages(buf, count, source, readTimeOut);
             }
 
             return 0;
@@ -152,7 +151,7 @@ namespace SHMPI
 
         template <typename T>
             requires IsShmpiTransmittable<T>
-        void SHMPI_IRead(const T *buf, int count, int dest, std::future<size_t> &result);
+        void SHMPI_IReadMyMessages(T *buf, int count, int dest, std::future<size_t> &result, int readTimeOut = -1);
 
     private:
         ShmpiInstance(size_t processRank, GlobalExecutionData &&hosts) : myRank(processRank), executionData(std::move(hosts))
@@ -220,7 +219,7 @@ namespace SHMPI
 
         template <typename T>
             requires IsShmpiTransmittable<T>
-        void SendToLocal(const T *buf, int count, size_t dest)
+        int SendToLocal(const T *buf, int count, size_t dest)
         {
             SharedMemoryProcessSegment *targetSegment = mappedSegments + dest;
             sem_wait(&(targetSegment->bufferAccessMutex));
@@ -232,11 +231,12 @@ namespace SHMPI
             sem_post(&(targetSegment->bufferAccessMutex));
 
             std::cout << "Sent data from " << myRank << " to " << dest << std::endl;
+            return 0;
         }
 
         template <typename T>
             requires IsShmpiTransmittable<T>
-        size_t ReadFromLocal(T *buf, size_t count, size_t source, int readTimeOut = -1)
+        size_t ReadMyMessages(T *buf, size_t count, size_t source, int readTimeOut = -1)
         {
             SharedMemoryProcessSegment *mySegment = mappedSegments + myRank;
 
@@ -246,7 +246,7 @@ namespace SHMPI
 
                 if (mySegment->lastAccessorRank == source) // TODO: probably think of something more efficient
                 {
-                    size_t numBytesToRead = std::min(SHARED_MEMORY_BUFFER_SIZE, sizeof(T) * count);
+                    size_t numBytesToRead = std::min(std::min(SHARED_MEMORY_BUFFER_SIZE, sizeof(T) * count), mySegment->bytesWritten);
 
                     memcpy(buf, mySegment->writeBuffer, numBytesToRead);
 
@@ -273,17 +273,17 @@ namespace SHMPI
                     nRead = readProcedure();
                     --readTimeOut;
                 }
-            }
+            }                                                                                                                                       
 
-            std::cout << "Received data from " << source << " . Me " << myRank << std::endl;
+            std::cout << "Received data from: " << source << " . My rank: " << myRank << std::endl;
             return nRead;
         }
 
         template <typename T>
             requires IsShmpiTransmittable<T>
-        void IReadFromLocal(T *buf, size_t count, size_t source, std::atomic_flag &flagToClear, std::promise<size_t> promise, int readTimeOut = -1)
+        void IReadMyMessages(T *buf, size_t count, size_t source, std::atomic_flag &flagToClear, std::promise<size_t> promise, int readTimeOut = -1)
         {
-            size_t result = ReadFromLocal(buf, count, source, readTimeOut);
+            size_t result = ReadMyMessages(buf, count, source, readTimeOut);
             promise.set_value(result);
             flagToClear.clear();
         }
@@ -348,7 +348,8 @@ namespace SHMPI
             result = sendResultPromise.get_future();
             (sendingFlags + dest)->test_and_set();
             
-            std::thread sender{ShmpiInstance::ISendToLocal, this, buf, count, dest, std::ref(*(sendingFlags + dest)), std::move(sendResultPromise)};
+            std::thread sender{&ShmpiInstance::ISendToLocal<T>, this, buf, count, dest, std::ref(*(sendingFlags + dest)), std::move(sendResultPromise)};
+            sender.detach();
 
             return;
         }
@@ -358,7 +359,7 @@ namespace SHMPI
 
     template <typename T>
         requires IsShmpiTransmittable<T>
-    void ShmpiInstance::SHMPI_IRead(const T *buf, int count, int dest, std::future<size_t> &result)
+    void ShmpiInstance::SHMPI_IReadMyMessages(T *buf, int count, int dest, std::future<size_t> &result, int readTimeOut)
     {
         if (dest >= executionData.nProcesses || iAmWaitingForDataAsync.test()) // performing two asynchronous reads currently is not possible
         {
@@ -367,7 +368,7 @@ namespace SHMPI
 
         if (comType == CommunicationType::SHMPI_LOCAL)
         {
-            if (sizeof(T) * count > SHARED_MEMORY_BUFFER_SIZE || count = 0)
+            if (sizeof(T) * count > SHARED_MEMORY_BUFFER_SIZE || count == 0)
             {
                 return;
             }
@@ -376,7 +377,8 @@ namespace SHMPI
             result = readResultPromise.get_future();
             iAmWaitingForDataAsync.test_and_set();
 
-            std::thread sender{ShmpiInstance::IReadFromLocal, this, buf, count, std::ref(iAmWaitingForDataAsync), std::move(readResultPromise), dest};
+            std::thread reader{&ShmpiInstance::IReadMyMessages<T>, this, buf, count, dest, std::ref(iAmWaitingForDataAsync), std::move(readResultPromise), readTimeOut};
+            reader.detach();
 
             return;
         }
